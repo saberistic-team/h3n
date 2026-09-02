@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.error import HTTPError, URLError
 
-from h3n.cli import DEFAULT_KERNEL, DEFAULT_MODEL, ProgressReporter, parser, run_direct, terminal_text
+from h3n.cli import DEFAULT_KERNEL, DEFAULT_MODEL, DEFAULT_TIMEOUT, ProgressReporter, parser, run_direct, terminal_text
 from h3n.kernel import AgentKernel, OllamaClient, OllamaError, StepLimitError
 from h3n.tools import Tool, ToolRegistry, default_registry
 
@@ -122,8 +122,10 @@ class CliTests(unittest.TestCase):
     def test_defaults_and_environment(self):
         args = parser({}).parse_args([])
         self.assertEqual((args.model, args.kernel), (DEFAULT_MODEL, DEFAULT_KERNEL))
-        args = parser({"H3N_MODEL": "x", "H3N_KERNEL": "direct", "OLLAMA_HOST": "http://x"}).parse_args([])
-        self.assertEqual((args.model, args.kernel, args.host), ("x", "direct", "http://x"))
+        self.assertEqual(args.timeout, DEFAULT_TIMEOUT)
+        args = parser({"H3N_MODEL": "x", "H3N_KERNEL": "direct", "OLLAMA_HOST": "http://x",
+                       "H3N_TIMEOUT": "45"}).parse_args([])
+        self.assertEqual((args.model, args.kernel, args.host, args.timeout), ("x", "direct", "http://x", 45.0))
 
     def test_direct_stream_parsing(self):
         client = mock.Mock(); client.stream_chat.return_value = iter(["hel", "lo"]); output = io.StringIO()

@@ -55,7 +55,10 @@ class OllamaClient:
         except urllib.error.URLError as exc:
             raise OllamaError(f"cannot reach Ollama at {self.host}; is it running? ({exc.reason})") from exc
         except TimeoutError as exc:
-            raise OllamaError(f"Ollama request timed out at {self.host}") from exc
+            raise OllamaError(
+                f"Ollama request timed out after {self.timeout:g}s at {self.host}; "
+                "retry with --timeout SECONDS or pre-load the model with ollama run"
+            ) from exc
 
     def chat(self, *, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"model": model, "messages": messages, "stream": False}

@@ -43,13 +43,14 @@ h3n --kernel direct -m llama3.2 "Write a haiku"
 ```text
 -m, --model MODEL       Ollama model tag
 --host URL              Ollama server (default http://localhost:11434)
+--timeout SECONDS       Ollama request timeout (default 300)
 -s, --system TEXT       Replace the system prompt
 --kernel h3n|direct     Agent loop or tool-free chat
 -y, --yes               Skip privileged-action prompts
 --max-steps N           Bound agent iterations (default 20)
 ```
 
-`H3N_MODEL`, `H3N_KERNEL`, and `OLLAMA_HOST` provide defaults; command-line options
+`H3N_MODEL`, `H3N_KERNEL`, `H3N_TIMEOUT`, and `OLLAMA_HOST` provide defaults; command-line options
 override them. The agent reports Ollama connectivity, model, HTTP, tool, timeout,
 permission, containment, and step-limit failures concisely.
 

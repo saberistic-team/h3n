@@ -16,6 +16,7 @@ from .tools import default_registry
 
 DEFAULT_MODEL = "qwen3.8:27b-mlx"
 DEFAULT_KERNEL = "h3n"
+DEFAULT_TIMEOUT = 300.0
 _MARKDOWN_ESCAPE = re.compile(r"\\([`*_{}\[\]()#+.!|>~-])")
 
 
@@ -114,6 +115,9 @@ def parser(environ: dict[str, str] | None = None) -> argparse.ArgumentParser:
     result.add_argument("task", nargs="?", help="task or chat prompt; omit for interactive mode")
     result.add_argument("-m", "--model", default=env.get("H3N_MODEL", DEFAULT_MODEL))
     result.add_argument("--host", default=env.get("OLLAMA_HOST", "http://localhost:11434"))
+    result.add_argument("--timeout", type=positive_float,
+                        default=env.get("H3N_TIMEOUT", DEFAULT_TIMEOUT),
+                        help="Ollama request timeout in seconds (default: 300)")
     result.add_argument("-s", "--system", default=DEFAULT_SYSTEM)
     result.add_argument("--kernel", choices=("h3n", "direct"), default=env.get("H3N_KERNEL", DEFAULT_KERNEL))
     result.add_argument("-y", "--yes", action="store_true", help="approve privileged tools without prompting")
@@ -125,6 +129,13 @@ def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
     return parsed
 
 
@@ -160,7 +171,7 @@ def run_direct(client: OllamaClient, model: str, system: str, task: str, history
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    client = OllamaClient(args.host)
+    client = OllamaClient(args.host, timeout=args.timeout)
     try:
         if args.kernel == "direct":
             history = [{"role": "system", "content": args.system}]
