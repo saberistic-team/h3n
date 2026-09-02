@@ -26,6 +26,10 @@ history is preserved. Exit using `/exit`, `/quit`, Ctrl-D, or Ctrl-C.
 Agent progress is written to stderr while the final, terminal-friendly response is
 written to stdout. A repository inspection may take several model/tool rounds; lines
 such as `Waiting for ...` and `Running tool: ...` show that the agent is still active.
+Ollama responses stream by default. A model's `thinking` stream is shown on stderr
+when provided; use `--hide-reasoning` for privacy or quieter output, or `--no-stream`
+for compatibility and debugging. Reasoning can be verbose and may contain sensitive
+workspace context.
 
 By default, `write`, `edit`, and `shell` actions require approval. Pass `--yes` (or
 `-y`) to approve them automatically. Reads, listings, and searches never prompt.
@@ -38,6 +42,13 @@ For tool-free streamed conversation:
 h3n --kernel direct -m llama3.2 "Write a haiku"
 ```
 
+To inspect a model's streamed reasoning while dogfooding:
+
+```sh
+h3n --show-reasoning --timeout 600 \
+  "Add a --version option, update tests and README, then run all tests."
+```
+
 ## Options and environment
 
 ```text
@@ -46,6 +57,9 @@ h3n --kernel direct -m llama3.2 "Write a haiku"
 --timeout SECONDS       Ollama request timeout (default 300)
 -s, --system TEXT       Replace the system prompt
 --kernel h3n|direct     Agent loop or tool-free chat
+--no-stream             Disable response streaming
+--show-reasoning        Show model thinking on stderr (default)
+--hide-reasoning        Hide model thinking
 -y, --yes               Skip privileged-action prompts
 --max-steps N           Bound agent iterations (default 20)
 ```

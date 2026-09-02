@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import TextIO
+from typing import Callable, TextIO
 
 from .kernel import DEFAULT_SYSTEM, AgentKernel, OllamaClient, OllamaError, StepLimitError
 from .tools import default_registry
@@ -26,18 +26,12 @@ class ProgressReporter:
     CYAN = "\033[36m"
     BLUE = "\033[34m"
     GREEN = "\033[32m"
+    MAGENTA = "\033[35m"
     YELLOW = "\033[33m"
     RED = "\033[31m"
     DIM = "\033[2m"
     RESET = "\033[0m"
     FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
-    THOUGHTS = (
-        "reviewing the workspace evidence",
-        "connecting the latest observations",
-        "deciding the most useful next step",
-        "checking whether more evidence is needed",
-    )
-
     def __init__(self, stream: TextIO = sys.stderr, environ: dict[str, str] | None = None):
         env = os.environ if environ is None else environ
         self.stream = stream
@@ -46,6 +40,9 @@ class ProgressReporter:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._waiting = ""
+        self._phase = ""
+        self._reasoning_open = False
+        self._reasoning_ended_line = True
 
     def _paint(self, text: str, color: str) -> str:
         return f"{color}{text}{self.RESET}" if self.color else text
@@ -55,7 +52,13 @@ class ProgressReporter:
         if event.startswith("Waiting for "):
             self.start_waiting(event)
             return
+        if event.startswith("Streaming response"):
+            self._phase = "receiving the model's response"
+            if not self.tty:
+                print("h3n 📡 Receiving streamed response", file=self.stream, flush=True)
+            return
         self.stop_waiting()
+        self.stop_reasoning()
         icon, color = self._style(event)
         print(f"{self._paint('h3n', self.CYAN)} {icon} {self._paint(event, color)}",
               file=self.stream, flush=True)
@@ -80,6 +83,7 @@ class ProgressReporter:
         # Turn "Waiting for model (step N/M)..." into useful context.
         detail = event.removeprefix("Waiting for ").removesuffix("...")
         self._waiting = detail
+        self._phase = ""
         self._stop.clear()
         if not self.tty:
             print(f"h3n 🧠 Model is reviewing observations · {detail}", file=self.stream, flush=True)
@@ -91,7 +95,7 @@ class ProgressReporter:
         started = time.monotonic()
         tick = 0
         while not self._stop.wait(0.12):
-            thought = self.THOUGHTS[(tick // 15) % len(self.THOUGHTS)]
+            thought = self._phase or "loading model and awaiting its first response"
             elapsed = int(time.monotonic() - started)
             line = (f"{self._paint('h3n', self.CYAN)} "
                     f"{self._paint(self.FRAMES[tick % len(self.FRAMES)], self.GREEN)} 🧠 "
@@ -106,7 +110,25 @@ class ProgressReporter:
             self._thread = None
             print("\r\033[2K", end="", file=self.stream, flush=True)
 
-    close = stop_waiting
+    def reasoning(self, text: str) -> None:
+        self.stop_waiting()
+        if not self._reasoning_open:
+            print(f"{self._paint('h3n', self.CYAN)} 🧠 {self._paint('Reasoning', self.MAGENTA)}",
+                  file=self.stream, flush=True)
+            self._reasoning_open = True
+        print(self._paint(text, self.DIM), end="", file=self.stream, flush=True)
+        self._reasoning_ended_line = text.endswith("\n")
+
+    def stop_reasoning(self) -> None:
+        if self._reasoning_open:
+            if not self._reasoning_ended_line:
+                print(file=self.stream, flush=True)
+            self._reasoning_open = False
+            self._reasoning_ended_line = True
+
+    def close(self) -> None:
+        self.stop_waiting()
+        self.stop_reasoning()
 
 
 def parser(environ: dict[str, str] | None = None) -> argparse.ArgumentParser:
@@ -120,6 +142,14 @@ def parser(environ: dict[str, str] | None = None) -> argparse.ArgumentParser:
                         help="Ollama request timeout in seconds (default: 300)")
     result.add_argument("-s", "--system", default=DEFAULT_SYSTEM)
     result.add_argument("--kernel", choices=("h3n", "direct"), default=env.get("H3N_KERNEL", DEFAULT_KERNEL))
+    result.add_argument("--no-stream", dest="stream", action="store_false",
+                        help="disable response streaming")
+    reasoning = result.add_mutually_exclusive_group()
+    reasoning.add_argument("--show-reasoning", dest="show_reasoning", action="store_true",
+                           help="show model thinking on stderr (default)")
+    reasoning.add_argument("--hide-reasoning", dest="show_reasoning", action="store_false",
+                           help="hide model thinking")
+    result.set_defaults(show_reasoning=True)
     result.add_argument("-y", "--yes", action="store_true", help="approve privileged tools without prompting")
     result.add_argument("--max-steps", type=positive_int, default=20)
     return result
@@ -156,16 +186,34 @@ def terminal_text(value: str) -> str:
 
 
 def run_direct(client: OllamaClient, model: str, system: str, task: str, history: list[dict] | None = None,
-               output: TextIO = sys.stdout) -> str:
+               output: TextIO = sys.stdout, *, stream: bool = True,
+               on_thinking: Callable[[str], None] | None = None,
+               on_content_start: Callable[[], None] | None = None) -> str:
     messages = history if history is not None else [{"role": "system", "content": system}]
     messages.append({"role": "user", "content": task})
     parts = []
-    for part in client.stream_chat(model=model, messages=messages):
+    thinking_parts = []
+    content_started = False
+
+    def receive_thinking(text: str) -> None:
+        thinking_parts.append(text)
+        if on_thinking is not None:
+            on_thinking(text)
+
+    for part in client.stream_chat(model=model, messages=messages, stream=stream,
+                                   on_thinking=receive_thinking):
+        if not content_started:
+            content_started = True
+            if on_content_start is not None:
+                on_content_start()
         print(part, end="", file=output, flush=True)
         parts.append(part)
     print(file=output)
     content = "".join(parts)
-    messages.append({"role": "assistant", "content": content})
+    assistant = {"role": "assistant", "content": content}
+    if thinking_parts:
+        assistant["thinking"] = "".join(thinking_parts)
+    messages.append(assistant)
     return content
 
 
@@ -174,18 +222,29 @@ def main(argv: list[str] | None = None) -> int:
     client = OllamaClient(args.host, timeout=args.timeout)
     try:
         if args.kernel == "direct":
+            reporter = ProgressReporter()
             history = [{"role": "system", "content": args.system}]
-            if args.task is not None:
-                run_direct(client, args.model, args.system, args.task, history)
-            else:
-                interactive(lambda text: run_direct(client, args.model, args.system, text, history))
+            reasoning = reporter.reasoning if args.show_reasoning else None
+            try:
+                if args.task is not None:
+                    run_direct(client, args.model, args.system, args.task, history,
+                               stream=args.stream, on_thinking=reasoning,
+                               on_content_start=reporter.stop_reasoning)
+                else:
+                    interactive(lambda text: run_direct(
+                        client, args.model, args.system, text, history,
+                        stream=args.stream, on_thinking=reasoning,
+                        on_content_start=reporter.stop_reasoning))
+            finally:
+                reporter.close()
         else:
             reporter = ProgressReporter()
             registry = default_registry(Path.cwd(), yes=args.yes,
                 approve=lambda name, values: confirm(name, values))
             kernel = AgentKernel(client, registry, model=args.model, system=args.system,
                                  max_steps=args.max_steps,
-                                 on_event=reporter)
+                                 stream=args.stream, show_reasoning=args.show_reasoning,
+                                 on_event=reporter, on_reasoning=reporter.reasoning)
             def run_agent(text: str) -> None:
                 response = kernel.run(text)
                 reporter.close()

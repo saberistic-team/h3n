@@ -126,12 +126,29 @@ class CliTests(unittest.TestCase):
         args = parser({"H3N_MODEL": "x", "H3N_KERNEL": "direct", "OLLAMA_HOST": "http://x",
                        "H3N_TIMEOUT": "45"}).parse_args([])
         self.assertEqual((args.model, args.kernel, args.host, args.timeout), ("x", "direct", "http://x", 45.0))
+        self.assertTrue(args.stream); self.assertTrue(args.show_reasoning)
+        args = parser({}).parse_args(["--no-stream", "--hide-reasoning"])
+        self.assertFalse(args.stream); self.assertFalse(args.show_reasoning)
 
     def test_direct_stream_parsing(self):
         client = mock.Mock(); client.stream_chat.return_value = iter(["hel", "lo"]); output = io.StringIO()
         history = [{"role": "system", "content": "s"}]
         self.assertEqual(run_direct(client, "m", "s", "q", history, output), "hello")
         self.assertEqual(output.getvalue(), "hello\n"); self.assertEqual(history[-1]["content"], "hello")
+
+    def test_direct_preserves_thinking_and_content_transition(self):
+        client = mock.Mock()
+        def stream_chat(**kwargs):
+            kwargs["on_thinking"]("thought ")
+            yield "answer"
+        client.stream_chat.side_effect = stream_chat
+        history = [{"role": "system", "content": "s"}]
+        thoughts, transitions = [], []
+        run_direct(client, "m", "s", "q", history, io.StringIO(),
+                   on_thinking=thoughts.append, on_content_start=lambda: transitions.append(True))
+        self.assertEqual(thoughts, ["thought "])
+        self.assertEqual(transitions, [True])
+        self.assertEqual(history[-1]["thinking"], "thought ")
 
     def test_terminal_text_removes_systematic_markdown_escapes(self):
         escaped = r"\- **No:** \`src/h3n/\_\_init\_\_.py\`"
@@ -161,6 +178,29 @@ class CliTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_streamed_chat_accumulates_content_thinking_and_tools(self):
+        body = b''.join([
+            b'{"message":{"role":"assistant","thinking":"plan "}}\n',
+            b'{"message":{"content":"I will inspect.","tool_calls":[{"function":{"name":"list","arguments":{}}}]}}\n',
+            b'{"message":{"thinking":"more","content":" Next."},"done":true}\n',
+        ])
+        seen = []
+        with mock.patch("urllib.request.urlopen", return_value=io.BytesIO(body)) as opened:
+            message = OllamaClient().chat(model="m", messages=[], tools=[], on_chunk=seen.append)
+        payload = json.loads(opened.call_args.args[0].data)
+        self.assertTrue(payload["stream"])
+        self.assertEqual(message["content"], "I will inspect. Next.")
+        self.assertEqual(message["thinking"], "plan more")
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "list")
+        self.assertEqual(len(seen), 3)
+
+    def test_non_streaming_fallback(self):
+        body = b'{"message":{"role":"assistant","content":"complete"},"done":true}'
+        with mock.patch("urllib.request.urlopen", return_value=io.BytesIO(body)) as opened:
+            message = OllamaClient().chat(model="m", messages=[], stream=False)
+        self.assertFalse(json.loads(opened.call_args.args[0].data)["stream"])
+        self.assertEqual(message["content"], "complete")
+
     def test_connection_error(self):
         with mock.patch("urllib.request.urlopen", side_effect=URLError("refused")):
             with self.assertRaisesRegex(OllamaError, "cannot reach"):

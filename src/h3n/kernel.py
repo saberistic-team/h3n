@@ -60,31 +60,74 @@ class OllamaClient:
                 "retry with --timeout SECONDS or pre-load the model with ollama run"
             ) from exc
 
-    def chat(self, *, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {"model": model, "messages": messages, "stream": False}
+    def chat(self, *, model: str, messages: list[dict[str, Any]],
+             tools: list[dict[str, Any]] | None = None, stream: bool = True,
+             on_chunk: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
         if tools is not None:
             payload["tools"] = tools
-        chunks = list(self._request(payload))
-        if not chunks or "message" not in chunks[-1]:
+        message: dict[str, Any] = {"role": "assistant", "content": ""}
+        received = False
+        tool_calls: list[dict[str, Any]] = []
+        thinking: list[str] = []
+        for chunk in self._request(payload):
+            part = chunk.get("message")
+            if not isinstance(part, dict):
+                continue
+            received = True
+            if on_chunk is not None:
+                on_chunk(part)
+            message["content"] += part.get("content", "")
+            if part.get("thinking"):
+                thinking.append(part["thinking"])
+            if part.get("tool_calls"):
+                tool_calls.extend(part["tool_calls"])
+            if part.get("role"):
+                message["role"] = part["role"]
+        if not received:
             raise OllamaError("Ollama returned no chat message")
-        return chunks[-1]["message"]
+        if thinking:
+            message["thinking"] = "".join(thinking)
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        return message
 
-    def stream_chat(self, *, model: str, messages: list[dict[str, Any]]) -> Iterable[str]:
+    def stream_chat(self, *, model: str, messages: list[dict[str, Any]], stream: bool = True,
+                    on_thinking: Callable[[str], None] | None = None) -> Iterable[str]:
+        if not stream:
+            message = self.chat(model=model, messages=messages, stream=False)
+            if message.get("thinking") and on_thinking is not None:
+                on_thinking(message["thinking"])
+            if message.get("content"):
+                yield message["content"]
+            return
+        received = False
         for chunk in self._request({"model": model, "messages": messages, "stream": True}):
-            content = chunk.get("message", {}).get("content", "")
-            if content:
-                yield content
+            message = chunk.get("message", {})
+            if message:
+                received = True
+            if message.get("thinking") and on_thinking is not None:
+                on_thinking(message["thinking"])
+            if message.get("content"):
+                yield message["content"]
+        if not received:
+            raise OllamaError("Ollama returned no chat message")
 
 
 class AgentKernel:
     def __init__(self, client: OllamaClient, registry: ToolRegistry, *, model: str,
                  system: str = DEFAULT_SYSTEM, max_steps: int = 20,
-                 on_event: Callable[[str], None] | None = None):
+                 stream: bool = True, show_reasoning: bool = False,
+                 on_event: Callable[[str], None] | None = None,
+                 on_reasoning: Callable[[str], None] | None = None):
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
         self.client, self.registry, self.model = client, registry, model
         self.max_steps = max_steps
+        self.stream = stream
+        self.show_reasoning = show_reasoning
         self.on_event = on_event
+        self.on_reasoning = on_reasoning
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
 
     def emit(self, message: str) -> None:
@@ -117,7 +160,20 @@ class AgentKernel:
         self.messages.append({"role": "user", "content": task})
         for step in range(1, self.max_steps + 1):
             self.emit(f"Waiting for {self.model} (step {step}/{self.max_steps})...")
-            message = self.client.chat(model=self.model, messages=self.messages, tools=self.registry.schemas)
+            saw_chunk = False
+
+            def receive(part: dict[str, Any]) -> None:
+                nonlocal saw_chunk
+                if not saw_chunk:
+                    saw_chunk = True
+                    self.emit("Streaming response from model...")
+                thinking = part.get("thinking", "")
+                if thinking and self.show_reasoning and self.on_reasoning is not None:
+                    self.on_reasoning(thinking)
+
+            message = self.client.chat(model=self.model, messages=self.messages,
+                                       tools=self.registry.schemas, stream=self.stream,
+                                       on_chunk=receive)
             self.messages.append(message)
             calls = message.get("tool_calls") or []
             if not calls:
