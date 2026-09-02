@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "h3n"
+version = "0.1.0"
+description = "A lightweight standalone coding-agent microkernel for Ollama"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "h3n contributors"}]
+
+[project.scripts]
+h3n = "h3n.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
