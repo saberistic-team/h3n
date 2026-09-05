@@ -15,6 +15,42 @@ from . import __version__
 from .kernel import DEFAULT_SYSTEM, AgentKernel, OllamaClient, OllamaError, StepLimitError
 from .tools import default_registry
 
+
+def _quote_path(value: str) -> str:
+    """Return a path rendered unambiguously, even when it contains spaces."""
+    return '"' + value + '"'
+
+
+def environment_context(workspace, python_executable=None) -> str:
+    """Build the trusted runtime-environment block appended to the system prompt.
+
+    It exposes only the resolved absolute workspace path and the active Python
+    executable, never unrelated environment variables, credentials, tokens, or
+    secrets.
+    """
+    resolved = Path(workspace).resolve()
+    executable = python_executable if python_executable is not None else sys.executable
+    return "\n".join([
+        "## Runtime environment",
+        "These values are resolved by h3n and trusted:",
+        f"Workspace path (absolute): {_quote_path(str(resolved))}",
+        f"Python executable (absolute): {_quote_path(str(executable))}",
+        "",
+        "All file tools and shell commands already run from the workspace, so pass "
+        "workspace-relative paths to file tools. Do not guess absolute paths such as "
+        "/workspace, and do not prefix shell commands with `cd` into the workspace.",
+        "Use the Python executable above when running tests or Python commands.",
+    ])
+
+
+def compose_system_prompt(base_system: str, workspace, python_executable=None) -> str:
+    """Append the trusted runtime-environment context to a base system prompt.
+
+    A custom prompt supplied through --system is preserved verbatim; the
+    environment context is only appended, never replacing it.
+    """
+    return f"{base_system}\n\n{environment_context(workspace, python_executable)}"
+
 DEFAULT_MODEL = "qwen3.8:27b-mlx"
 DEFAULT_KERNEL = "h3n"
 DEFAULT_TIMEOUT = 300.0
@@ -266,28 +302,30 @@ def run_direct(client: OllamaClient, model: str, system: str, task: str, history
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     client = OllamaClient(args.host, timeout=args.timeout)
+    workspace = Path.cwd().resolve()
+    system_prompt = compose_system_prompt(args.system, workspace, sys.executable)
     try:
         if args.kernel == "direct":
             reporter = ProgressReporter()
-            history = [{"role": "system", "content": args.system}]
+            history = [{"role": "system", "content": system_prompt}]
             reasoning = reporter.reasoning if args.show_reasoning else None
             try:
                 if args.task is not None:
-                    run_direct(client, args.model, args.system, args.task, history,
+                    run_direct(client, args.model, system_prompt, args.task, history,
                                stream=args.stream, on_thinking=reasoning,
                                on_content_start=reporter.stop_reasoning)
                 else:
                     interactive(lambda text: run_direct(
-                        client, args.model, args.system, text, history,
+                        client, args.model, system_prompt, text, history,
                         stream=args.stream, on_thinking=reasoning,
                         on_content_start=reporter.stop_reasoning))
             finally:
                 reporter.close()
         else:
             reporter = ProgressReporter()
-            registry = default_registry(Path.cwd(), yes=args.yes,
+            registry = default_registry(workspace, yes=args.yes,
                 approve=lambda name, values: confirm(name, values))
-            kernel = AgentKernel(client, registry, model=args.model, system=args.system,
+            kernel = AgentKernel(client, registry, model=args.model, system=system_prompt,
                                  max_steps=args.max_steps,
                                  stream=args.stream, show_reasoning=args.show_reasoning,
                                  max_tools_per_step=args.max_tools_per_step,

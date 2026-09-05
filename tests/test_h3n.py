@@ -1,13 +1,15 @@
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 from urllib.error import HTTPError, URLError
 
-from h3n.cli import DEFAULT_KERNEL, DEFAULT_MODEL, DEFAULT_TIMEOUT, ProgressReporter, parser, run_direct, terminal_text
+from h3n.cli import (DEFAULT_KERNEL, DEFAULT_MODEL, DEFAULT_TIMEOUT, ProgressReporter,
+                    compose_system_prompt, environment_context, parser, run_direct, terminal_text)
 from h3n.kernel import AgentKernel, OllamaClient, OllamaError, StepLimitError
 from h3n.tools import Tool, ToolRegistry, default_registry
 
@@ -321,6 +323,74 @@ class TransportTests(unittest.TestCase):
             with mock.patch("urllib.request.urlopen", side_effect=error):
                 with self.assertRaisesRegex(OllamaError, phrase):
                     OllamaClient().chat(model="m", messages=[])
+
+
+class EnvironmentContextTests(unittest.TestCase):
+    def test_workspace_appears_in_model_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            system = compose_system_prompt("base system", workspace, "/usr/bin/python3")
+            kernel = AgentKernel(FakeClient([{"role": "assistant", "content": "done"}]),
+                                 default_registry(workspace), model="m", system=system)
+            kernel.run("inspect")
+            model_system = kernel.messages[0]["content"]
+            self.assertEqual(kernel.messages[0]["role"], "system")
+            self.assertIn(str(workspace), model_system)
+            self.assertIn("Workspace path (absolute):", model_system)
+
+    def test_active_python_appears_in_model_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            system = compose_system_prompt("base", workspace, "/usr/bin/python3")
+            kernel = AgentKernel(FakeClient([{"role": "assistant", "content": "done"}]),
+                                 default_registry(workspace), model="m", system=system)
+            kernel.run("inspect")
+            model_system = kernel.messages[0]["content"]
+            self.assertIn("/usr/bin/python3", model_system)
+            self.assertIn("Python executable (absolute):", model_system)
+
+    def test_active_python_defaults_to_current_executable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = environment_context(Path(tmp))
+            self.assertIn(str(sys.executable), text)
+
+    def test_custom_system_text_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            text = compose_system_prompt("MY CUSTOM INSTRUCTIONS", workspace, "/usr/bin/python3")
+            self.assertIn("MY CUSTOM INSTRUCTIONS", text)
+            self.assertIn("## Runtime environment", text)
+            self.assertLess(text.index("MY CUSTOM INSTRUCTIONS"), text.index("## Runtime environment"))
+
+    def test_environment_context_exposes_no_secrets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            text = environment_context(workspace, "/usr/bin/python3")
+            for sensitive in ("TOKEN", "SECRET", "PASSWORD", "API_KEY"):
+                self.assertNotIn(sensitive, text)
+
+    def test_context_is_not_duplicated_across_turns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            system = compose_system_prompt("base", workspace, "/usr/bin/python3")
+            kernel = AgentKernel(FakeClient([
+                 {"role": "assistant", "content": "one"},
+                 {"role": "assistant", "content": "two"},
+             ]), default_registry(workspace), model="m", system=system)
+            kernel.run("first turn")
+            kernel.run("second turn")
+            systems = [m for m in kernel.messages if m["role"] == "system"]
+            self.assertEqual(len(systems), 1)
+            self.assertEqual(systems[0]["content"].count("## Runtime environment"), 1)
+
+    def test_path_with_spaces_is_unambiguous(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spaced = Path(tmp, "a b").resolve()
+            spaced.mkdir()
+            text = environment_context(spaced, "/usr/bin/python3")
+            quoted = '"' + str(spaced) + '"'
+            self.assertIn(quoted, text)
+            self.assertNotIn(str(spaced) + "\n", text)
 
 
 if __name__ == "__main__": unittest.main()

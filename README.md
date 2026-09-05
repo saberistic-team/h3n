@@ -81,6 +81,18 @@ intact.
 override them. The agent reports Ollama connectivity, model, HTTP, tool, timeout,
 permission, containment, and step-limit failures concisely.
 
+## Runtime environment context
+
+Before each session, `h3n` appends a short, trusted runtime-environment block to the
+system prompt. It states the resolved absolute workspace path and the active Python
+executable, and tells the model that file tools and shell commands already run from the
+workspace, so it should not guess absolute paths such as `/workspace` or prefix shell
+commands with `cd`, and should use the reported Python executable for tests and Python
+commands. The block is added once per session, so interactive turns do not duplicate it.
+A prompt supplied through `-s`/`--system` is preserved; the environment context is only
+appended. Paths containing spaces are rendered in quotes so they cannot be misread.
+Unrelated environment variables, credentials, tokens, and secrets are never exposed.
+
 ## Tests
 
 ```sh
