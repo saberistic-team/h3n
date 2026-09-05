@@ -15,6 +15,8 @@ DEFAULT_SYSTEM = """You are h3n, a coding agent operating in a local workspace.
 Inspect before editing. Make focused changes. Verify completed work. Use tools whenever
 claims depend on workspace state. Never claim success without supporting tool output.
 When calling tools, put one short sentence in content explaining your next decision.
+Reason only until the next concrete action is clear, then call the tool immediately.
+Do not analyze the entire task or narrate implementation details before taking action.
 Finish with a concise summary and verification result. Your final response is printed
 directly in a terminal: use clean plain text, not Markdown, and never backslash-escape
 formatting characters."""
@@ -48,7 +50,10 @@ class OllamaClient:
                     except json.JSONDecodeError as exc:
                         raise OllamaError("Ollama returned malformed JSON") from exc
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode(errors="replace")
+            try:
+                detail = exc.read().decode(errors="replace")
+            finally:
+                exc.close()
             if exc.code == 404 and "model" in detail.lower():
                 raise OllamaError(f"model not found: {detail}") from exc
             raise OllamaError(f"Ollama HTTP {exc.code}: {detail or exc.reason}") from exc
@@ -62,14 +67,18 @@ class OllamaClient:
 
     def chat(self, *, model: str, messages: list[dict[str, Any]],
              tools: list[dict[str, Any]] | None = None, stream: bool = True,
-             on_chunk: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
+             on_chunk: Callable[[dict[str, Any]], None] | None = None,
+             options: dict[str, Any] | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
         if tools is not None:
             payload["tools"] = tools
+        if options:
+            payload["options"] = options
         message: dict[str, Any] = {"role": "assistant", "content": ""}
         received = False
         tool_calls: list[dict[str, Any]] = []
         thinking: list[str] = []
+        done_reason: str | None = None
         for chunk in self._request(payload):
             part = chunk.get("message")
             if not isinstance(part, dict):
@@ -84,12 +93,17 @@ class OllamaClient:
                 tool_calls.extend(part["tool_calls"])
             if part.get("role"):
                 message["role"] = part["role"]
+            if chunk.get("done_reason"):
+                done_reason = chunk["done_reason"]
         if not received:
             raise OllamaError("Ollama returned no chat message")
         if thinking:
             message["thinking"] = "".join(thinking)
         if tool_calls:
             message["tool_calls"] = tool_calls
+        if done_reason:
+            # Internal transport metadata; AgentKernel removes it before history.
+            message["_done_reason"] = done_reason
         return message
 
     def stream_chat(self, *, model: str, messages: list[dict[str, Any]], stream: bool = True,
@@ -118,6 +132,8 @@ class AgentKernel:
     def __init__(self, client: OllamaClient, registry: ToolRegistry, *, model: str,
                  system: str = DEFAULT_SYSTEM, max_steps: int = 20,
                  stream: bool = True, show_reasoning: bool = False,
+                 max_tools_per_step: int = 3, action_tokens: int = 0,
+                 observation_limit: int = 8_000, context_limit: int = 50_000,
                  on_event: Callable[[str], None] | None = None,
                  on_reasoning: Callable[[str], None] | None = None):
         if max_steps < 1:
@@ -126,9 +142,40 @@ class AgentKernel:
         self.max_steps = max_steps
         self.stream = stream
         self.show_reasoning = show_reasoning
+        self.max_tools_per_step = max_tools_per_step
+        self.action_tokens = action_tokens
+        self.observation_limit = observation_limit
+        self.context_limit = context_limit
         self.on_event = on_event
         self.on_reasoning = on_reasoning
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
+
+    def compact_context(self) -> None:
+        """Mechanically compact old tool output while preserving recent evidence."""
+        size = sum(len(json.dumps(item, ensure_ascii=False)) for item in self.messages)
+        if size <= self.context_limit:
+            return
+        tool_indexes = [i for i, item in enumerate(self.messages) if item.get("role") == "tool"]
+        for index in tool_indexes[:-4]:
+            content = self.messages[index].get("content", "")
+            if content.startswith("[compacted "):
+                continue
+            self.messages[index]["content"] = f"[compacted tool observation: {len(content):,} chars]"
+            size = sum(len(json.dumps(item, ensure_ascii=False)) for item in self.messages)
+            if size <= self.context_limit:
+                break
+
+    def observation(self, result: dict[str, Any]) -> str:
+        serialized = json.dumps(result, ensure_ascii=False)
+        if len(serialized) <= self.observation_limit:
+            return serialized
+        preview_limit = max(0, self.observation_limit - 160)
+        return json.dumps({
+            "ok": result.get("ok", False),
+            "truncated": True,
+            "original_chars": len(serialized),
+            "preview": serialized[:preview_limit],
+        }, ensure_ascii=False)
 
     def emit(self, message: str) -> None:
         if self.on_event is not None:
@@ -158,8 +205,60 @@ class AgentKernel:
 
     def run(self, task: str) -> str:
         self.messages.append({"role": "user", "content": task})
+        self.emit(f"Objective: {task}")
+        token_budget: int | None = self.action_tokens or None
+        pending_calls: list[dict[str, Any]] = []
+
+        def execute_calls(calls: list[dict[str, Any]]) -> None:
+            for call in calls:
+                function = call.get("function") or {}
+                name = function.get("name", "")
+                arguments = function.get("arguments", {})
+                display_arguments = arguments
+                if isinstance(arguments, str):
+                    try:
+                        display_arguments = json.loads(arguments)
+                    except json.JSONDecodeError:
+                        pass
+                self.emit(self.describe_tool(name, display_arguments))
+                result = self.registry.execute(name, arguments)
+                if not result.get("ok"):
+                    self.emit(f"Tool failed: {result.get('error', 'unknown error')}")
+                else:
+                    self.emit(f"Completed: {name}")
+                observation = {
+                    "role": "tool",
+                    "content": self.observation(result),
+                    "tool_name": name,
+                }
+                if call.get("id"):
+                    observation["tool_call_id"] = call["id"]
+                self.messages.append(observation)
+
         for step in range(1, self.max_steps + 1):
-            self.emit(f"Waiting for {self.model} (step {step}/{self.max_steps})...")
+            if pending_calls:
+                calls = pending_calls[:self.max_tools_per_step]
+                pending_calls = pending_calls[self.max_tools_per_step:]
+                self.emit(
+                    f"Running {len(calls)} deferred tool call{'s' if len(calls) != 1 else ''} "
+                    f"(step {step}/{self.max_steps})"
+                )
+                # Record a matching assistant call message so native Ollama tool
+                # observations remain protocol-valid without another model request.
+                self.messages.append({"role": "assistant", "content": "", "tool_calls": calls})
+                execute_calls(calls)
+                if pending_calls:
+                    self.emit(
+                        f"Deferred {len(pending_calls)} tool call"
+                        f"{'s' if len(pending_calls) != 1 else ''} to keep this step focused"
+                    )
+                continue
+            self.compact_context()
+            context_chars = sum(len(json.dumps(item, ensure_ascii=False)) for item in self.messages)
+            self.emit(
+                f"Waiting for {self.model} (step {step}/{self.max_steps}; "
+                f"{len(self.messages)} messages, {context_chars:,} context chars)..."
+            )
             saw_chunk = False
 
             def receive(part: dict[str, Any]) -> None:
@@ -173,31 +272,39 @@ class AgentKernel:
 
             message = self.client.chat(model=self.model, messages=self.messages,
                                        tools=self.registry.schemas, stream=self.stream,
-                                       on_chunk=receive)
+                                       on_chunk=receive,
+                                       options=({"num_predict": token_budget}
+                                                if token_budget is not None else None))
+            done_reason = message.pop("_done_reason", None)
+            all_calls = message.get("tool_calls") or []
+            calls = all_calls[:self.max_tools_per_step]
+            pending_calls = all_calls[self.max_tools_per_step:]
+            deferred = len(pending_calls)
+            if not calls and done_reason in {"length", "max_tokens"}:
+                if token_budget is None:
+                    raise StepLimitError(
+                        "model stopped because of its generation limit without producing "
+                        "an action or final response"
+                    )
+                self.emit(
+                    f"Generation budget reached ({token_budget} tokens); "
+                    "retrying once without an action-token cap"
+                )
+                token_budget = None
+                # Do not put a partial reasoning turn into history. Retrying the
+                # same prompt with a larger budget avoids repetitive continuations.
+                continue
+            if calls:
+                message = dict(message)
+                message["tool_calls"] = calls
             self.messages.append(message)
-            calls = message.get("tool_calls") or []
             if not calls:
                 return message.get("content", "")
+            token_budget = self.action_tokens or None
             decision = message.get("content", "").strip()
             if decision:
                 self.emit(decision)
-            for call in calls:
-                function = call.get("function") or {}
-                name = function.get("name", "")
-                arguments = function.get("arguments", {})
-                # Ollama may return tool arguments as either an object or a JSON string.
-                display_arguments = arguments
-                if isinstance(arguments, str):
-                    try:
-                        display_arguments = json.loads(arguments)
-                    except json.JSONDecodeError:
-                        pass
-                self.emit(self.describe_tool(name, display_arguments))
-                result = self.registry.execute(name, arguments)
-                if not result.get("ok"):
-                    self.emit(f"Tool failed: {result.get('error', 'unknown error')}")
-                observation = {"role": "tool", "content": json.dumps(result, ensure_ascii=False)}
-                if call.get("id"):
-                    observation["tool_call_id"] = call["id"]
-                self.messages.append(observation)
+            if deferred:
+                self.emit(f"Deferred {deferred} tool call{'s' if deferred != 1 else ''} to keep this step focused")
+            execute_calls(calls)
         raise StepLimitError(f"maximum step count reached ({self.max_steps})")

@@ -31,6 +31,8 @@ class KernelTests(unittest.TestCase):
             observations = [m for m in kernel.messages if m["role"] == "tool"]
             self.assertEqual(len(observations), 2)
             self.assertIn("hello", observations[0]["content"])
+            self.assertEqual(observations[0]["tool_name"], "read")
+            self.assertEqual(observations[1]["tool_name"], "list")
 
     def test_max_steps(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -47,8 +49,90 @@ class KernelTests(unittest.TestCase):
             ])
             kernel = AgentKernel(client, default_registry(tmp), model="m", on_event=events.append)
             self.assertEqual(kernel.run("inspect"), "done")
-            self.assertEqual(events, ["Waiting for m (step 1/20)...", "Inspecting files in .",
-                                      "Waiting for m (step 2/20)..."])
+            self.assertEqual(events[0], "Objective: inspect")
+            self.assertEqual(events[2], "Inspecting files in .")
+            self.assertEqual(events[3], "Completed: list")
+            self.assertRegex(events[1], r"Waiting for m \(step 1/20; 2 messages, [\d,]+ context chars\)\.\.\.")
+            self.assertRegex(events[4], r"Waiting for m \(step 2/20; 4 messages, [\d,]+ context chars\)\.\.\.")
+
+    def test_micro_step_caps_tools_and_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = [{"function": {"name": "list", "arguments": {}}} for _ in range(4)]
+            client = FakeClient([
+                {"role": "assistant", "content": "inspect", "tool_calls": calls},
+                {"role": "assistant", "content": "done"},
+            ])
+            events = []
+            kernel = AgentKernel(client, default_registry(tmp), model="m",
+                                 max_tools_per_step=2, action_tokens=123,
+                                 on_event=events.append)
+            self.assertEqual(kernel.run("task"), "done")
+            self.assertEqual(len(kernel.messages[2]["tool_calls"]), 2)
+            self.assertEqual(client.seen[0]["options"], {"num_predict": 123})
+            self.assertIn("Deferred 2 tool calls to keep this step focused", events)
+            observations = [m for m in kernel.messages if m["role"] == "tool"]
+            self.assertEqual(len(observations), 4)
+
+    def test_deferred_calls_are_preserved_and_executed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = [{"function": {"name": "list", "arguments": {}}} for _ in range(3)]
+             # Three calls at once but a per-step budget of two, so the third is
+             # carried over and must still execute rather than be dropped.
+            client = FakeClient([
+                {"role": "assistant", "content": "inspect", "tool_calls": calls},
+                {"role": "assistant", "content": "done"},
+            ])
+            events = []
+            kernel = AgentKernel(client, default_registry(tmp), model="m",
+                                 max_tools_per_step=2, on_event=events.append)
+            self.assertEqual(kernel.run("task"), "done")
+            observations = [m for m in kernel.messages if m["role"] == "tool"]
+            self.assertEqual(len(observations), 3)
+            self.assertIn("Deferred 1 tool call to keep this step focused", events)
+
+    def test_large_deferred_queue_stays_within_batch_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = [{"function": {"name": "list", "arguments": {}}} for _ in range(7)]
+            client = FakeClient([
+                {"role": "assistant", "content": "inspect", "tool_calls": calls},
+                {"role": "assistant", "content": "done"},
+            ])
+            events = []
+            kernel = AgentKernel(client, default_registry(tmp), model="m",
+                                 max_tools_per_step=2, on_event=events.append)
+            self.assertEqual(kernel.run("task"), "done")
+            self.assertEqual(len(client.seen), 2)
+            batches = [message["tool_calls"] for message in kernel.messages
+                       if message.get("role") == "assistant" and message.get("tool_calls")]
+            self.assertEqual([len(batch) for batch in batches], [2, 2, 2, 1])
+            self.assertEqual(len([m for m in kernel.messages if m["role"] == "tool"]), 7)
+
+    def test_observation_limit_and_context_compaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kernel = AgentKernel(FakeClient([]), default_registry(tmp), model="m",
+                                 observation_limit=200, context_limit=300)
+            limited = json.loads(kernel.observation({"ok": True, "result": "x" * 1000}))
+            self.assertTrue(limited["truncated"])
+            kernel.messages.extend({"role": "tool", "content": "x" * 200} for _ in range(6))
+            kernel.compact_context()
+            self.assertTrue(kernel.messages[1]["content"].startswith("[compacted "))
+
+    def test_length_limited_turn_retries_once_without_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = FakeClient([
+                {"role": "assistant", "content": "partial", "thinking": "unfinished",
+                 "_done_reason": "length"},
+                {"role": "assistant", "content": "complete", "_done_reason": "stop"},
+            ])
+            events = []
+            kernel = AgentKernel(client, default_registry(tmp), model="m",
+                                 action_tokens=100, on_event=events.append)
+            self.assertEqual(kernel.run("task"), "complete")
+            self.assertNotIn("_done_reason", kernel.messages[2])
+            self.assertNotIn("partial", [item.get("content") for item in kernel.messages])
+            self.assertEqual(client.seen[0]["options"], {"num_predict": 100})
+            self.assertIsNone(client.seen[1]["options"])
+            self.assertIn("Generation budget reached (100 tokens); retrying once without an action-token cap", events)
 
     def test_model_decision_and_natural_tool_description(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -91,6 +175,18 @@ class ToolTests(unittest.TestCase):
         auto = default_registry(self.root, yes=True, approve=lambda *_: self.fail("prompted"))
         self.assertTrue(auto.execute("write", {"path": "y", "content": "y"})["ok"])
 
+    def test_invalid_privileged_arguments_do_not_prompt(self):
+        registry = default_registry(self.root, approve=lambda *_: self.fail("approval requested"))
+        missing = registry.execute("write", {"content": "x"})
+        self.assertFalse(missing["ok"])
+        self.assertIn("missing required argument: path", missing["error"])
+        unexpected = registry.execute("shell", {"command": "true", "surprise": True})
+        self.assertFalse(unexpected["ok"])
+        self.assertIn("unexpected argument: surprise", unexpected["error"])
+        wrong_type = registry.execute("shell", {"command": 123})
+        self.assertFalse(wrong_type["ok"])
+        self.assertIn("expected string", wrong_type["error"])
+
     def test_traversal_symlink_and_search_containment(self):
         outside = Path(self.temp.name).parent / (Path(self.temp.name).name + "-outside")
         outside.mkdir(exist_ok=True); (outside / "secret").write_text("secret")
@@ -127,8 +223,19 @@ class CliTests(unittest.TestCase):
                        "H3N_TIMEOUT": "45"}).parse_args([])
         self.assertEqual((args.model, args.kernel, args.host, args.timeout), ("x", "direct", "http://x", 45.0))
         self.assertTrue(args.stream); self.assertTrue(args.show_reasoning)
+        self.assertEqual((args.max_tools_per_step, args.action_tokens,
+                          args.observation_limit, args.context_limit), (3, 0, 8000, 50000))
         args = parser({}).parse_args(["--no-stream", "--hide-reasoning"])
         self.assertFalse(args.stream); self.assertFalse(args.show_reasoning)
+
+    def test_version_option(self):
+        from h3n import __version__
+        output = io.StringIO()
+        with mock.patch("sys.stdout", new=output):
+            with self.assertRaises(SystemExit) as ctx:
+                parser().parse_args(["--version"])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(output.getvalue().strip(), f"h3n {__version__}")
 
     def test_direct_stream_parsing(self):
         client = mock.Mock(); client.stream_chat.return_value = iter(["hel", "lo"]); output = io.StringIO()
@@ -192,14 +299,16 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(message["content"], "I will inspect. Next.")
         self.assertEqual(message["thinking"], "plan more")
         self.assertEqual(message["tool_calls"][0]["function"]["name"], "list")
+        self.assertIsNone(message.get("_done_reason"))
         self.assertEqual(len(seen), 3)
 
     def test_non_streaming_fallback(self):
-        body = b'{"message":{"role":"assistant","content":"complete"},"done":true}'
+        body = b'{"message":{"role":"assistant","content":"complete"},"done":true,"done_reason":"stop"}'
         with mock.patch("urllib.request.urlopen", return_value=io.BytesIO(body)) as opened:
             message = OllamaClient().chat(model="m", messages=[], stream=False)
         self.assertFalse(json.loads(opened.call_args.args[0].data)["stream"])
         self.assertEqual(message["content"], "complete")
+        self.assertEqual(message["_done_reason"], "stop")
 
     def test_connection_error(self):
         with mock.patch("urllib.request.urlopen", side_effect=URLError("refused")):

@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Callable, TextIO
 
+from . import __version__
 from .kernel import DEFAULT_SYSTEM, AgentKernel, OllamaClient, OllamaError, StepLimitError
 from .tools import default_registry
 
@@ -64,6 +65,14 @@ class ProgressReporter:
               file=self.stream, flush=True)
 
     def _style(self, event: str) -> tuple[str, str]:
+        if event.startswith("Objective:"):
+            return "🎯", self.MAGENTA
+        if event.startswith("Completed:"):
+            return "✅", self.GREEN
+        if event.startswith("Deferred "):
+            return "⏭️ ", self.YELLOW
+        if event.startswith("Generation budget reached"):
+            return "🔄", self.YELLOW
         if event.startswith("Reading "):
             return "📖", self.BLUE
         if event.startswith("Inspecting "):
@@ -83,7 +92,9 @@ class ProgressReporter:
         # Turn "Waiting for model (step N/M)..." into useful context.
         detail = event.removeprefix("Waiting for ").removesuffix("...")
         self._waiting = detail
-        self._phase = ""
+        self._phase = ("loading model and awaiting its first response"
+                       if "(step 1/" in detail else
+                       "evaluating tool results and planning the next step")
         self._stop.clear()
         if not self.tty:
             print(f"h3n 🧠 Model is reviewing observations · {detail}", file=self.stream, flush=True)
@@ -94,9 +105,27 @@ class ProgressReporter:
     def _spin(self) -> None:
         started = time.monotonic()
         tick = 0
+        last_milestone = -1
+        milestones = (
+            (0, "request submitted to Ollama"),
+            (5, "model is evaluating the conversation"),
+            (15, "still evaluating context; no streamed chunk yet"),
+            (30, "Ollama is busy; waiting for the first streamed chunk"),
+            (60, "long prompt evaluation; model has not produced a chunk"),
+            (120, "extended evaluation; check ollama ps if resources look constrained"),
+        )
         while not self._stop.wait(0.12):
-            thought = self._phase or "loading model and awaiting its first response"
             elapsed = int(time.monotonic() - started)
+            thought = self._phase
+            if self._phase != "receiving the model's response":
+                milestone = max(i for i, (seconds, _) in enumerate(milestones) if elapsed >= seconds)
+                thought = milestones[milestone][1]
+                if milestone != last_milestone and last_milestone >= 0:
+                    update = (f"{self._paint('h3n', self.CYAN)} ⏱️  "
+                              f"{self._paint(thought, self.YELLOW)} "
+                              f"{self._paint(f'· {elapsed}s elapsed', self.DIM)}")
+                    print("\r\033[2K" + update, file=self.stream, flush=True)
+                last_milestone = milestone
             line = (f"{self._paint('h3n', self.CYAN)} "
                     f"{self._paint(self.FRAMES[tick % len(self.FRAMES)], self.GREEN)} 🧠 "
                     f"{thought} {self._paint(f'· {self._waiting} · {elapsed}s', self.DIM)}")
@@ -135,6 +164,8 @@ def parser(environ: dict[str, str] | None = None) -> argparse.ArgumentParser:
     env = os.environ if environ is None else environ
     result = argparse.ArgumentParser(prog="h3n", description="Standalone coding agent for Ollama")
     result.add_argument("task", nargs="?", help="task or chat prompt; omit for interactive mode")
+    result.add_argument("--version", action="version", version=f"h3n {__version__}",
+                        help="show program version and exit")
     result.add_argument("-m", "--model", default=env.get("H3N_MODEL", DEFAULT_MODEL))
     result.add_argument("--host", default=env.get("OLLAMA_HOST", "http://localhost:11434"))
     result.add_argument("--timeout", type=positive_float,
@@ -152,6 +183,14 @@ def parser(environ: dict[str, str] | None = None) -> argparse.ArgumentParser:
     result.set_defaults(show_reasoning=True)
     result.add_argument("-y", "--yes", action="store_true", help="approve privileged tools without prompting")
     result.add_argument("--max-steps", type=positive_int, default=20)
+    result.add_argument("--max-tools-per-step", type=positive_int, default=3,
+                        help="maximum tool calls executed per model round (default: 3)")
+    result.add_argument("--action-tokens", type=nonnegative_int, default=0,
+                        help="optional generation cap per round; 0 is unlimited (default)")
+    result.add_argument("--observation-limit", type=positive_int, default=8000,
+                        help="maximum characters retained per tool result (default: 8000)")
+    result.add_argument("--context-limit", type=positive_int, default=50000,
+                        help="compact old tool results above this size (default: 50000)")
     return result
 
 
@@ -166,6 +205,13 @@ def positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
     return parsed
 
 
@@ -244,6 +290,10 @@ def main(argv: list[str] | None = None) -> int:
             kernel = AgentKernel(client, registry, model=args.model, system=args.system,
                                  max_steps=args.max_steps,
                                  stream=args.stream, show_reasoning=args.show_reasoning,
+                                 max_tools_per_step=args.max_tools_per_step,
+                                 action_tokens=args.action_tokens,
+                                 observation_limit=args.observation_limit,
+                                 context_limit=args.context_limit,
                                  on_event=reporter, on_reasoning=reporter.reasoning)
             def run_agent(text: str) -> None:
                 response = kernel.run(text)

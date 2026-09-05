@@ -52,6 +52,7 @@ h3n --show-reasoning --timeout 600 \
 ## Options and environment
 
 ```text
+--version               Show program version and exit
 -m, --model MODEL       Ollama model tag
 --host URL              Ollama server (default http://localhost:11434)
 --timeout SECONDS       Ollama request timeout (default 300)
@@ -62,7 +63,19 @@ h3n --show-reasoning --timeout 600 \
 --hide-reasoning        Hide model thinking
 -y, --yes               Skip privileged-action prompts
 --max-steps N           Bound agent iterations (default 20)
+--max-tools-per-step N  Bound each tool batch (default 3)
+--action-tokens N       Optional generation cap; 0 is unlimited (default)
+--observation-limit N   Characters retained per tool result (default 8000)
+--context-limit N       Compact old tool output above this size (default 50000)
 ```
+
+The bounded tool and observation defaults encourage small action/observation cycles.
+Generation is unlimited by default because reasoning models may consume a token cap
+before producing a tool call. `h3n` shows the current objective, completed tools, and
+deferred calls. When a batch exceeds the per-step limit, the deferred calls are kept and
+executed in a later step so no call is silently lost. Old tool results are compacted
+mechanically when the conversation grows, while the four most recent observations remain
+intact.
 
 `H3N_MODEL`, `H3N_KERNEL`, `H3N_TIMEOUT`, and `OLLAMA_HOST` provide defaults; command-line options
 override them. The agent reports Ollama connectivity, model, HTTP, tool, timeout,

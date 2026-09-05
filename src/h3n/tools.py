@@ -15,6 +15,23 @@ class ToolError(Exception):
     """An error safe to return to the model as a tool observation."""
 
 
+def _check_argument_type(name: str, value: Any, schema: dict[str, Any]) -> None:
+    expected = schema.get("type")
+    valid = {
+        "string": lambda item: isinstance(item, str),
+        "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+        "number": lambda item: isinstance(item, (int, float)) and not isinstance(item, bool),
+        "boolean": lambda item: isinstance(item, bool),
+        "object": lambda item: isinstance(item, dict),
+        "array": lambda item: isinstance(item, list),
+    }
+    if expected in valid and not valid[expected](value):
+        raise ToolError(f"invalid argument {name}: expected {expected}")
+    minimum = schema.get("minimum")
+    if minimum is not None and isinstance(value, (int, float)) and value < minimum:
+        raise ToolError(f"invalid argument {name}: must be at least {minimum}")
+
+
 @dataclass
 class Tool:
     name: str
@@ -56,9 +73,13 @@ class ToolRegistry:
             return {"ok": False, "error": f"unknown tool: {name}"}
         try:
             if isinstance(arguments, str):
-                arguments = json.loads(arguments)
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError as exc:
+                    raise ToolError(f"invalid tool arguments JSON: {exc}") from exc
             if not isinstance(arguments, dict):
                 raise ToolError("tool arguments must be a JSON object")
+            self._validate_arguments(tool, arguments)
             if tool.privileged and not self.yes:
                 if self.approve is None or not self.approve(name, arguments):
                     raise ToolError(f"action denied: {name}")
@@ -68,6 +89,20 @@ class ToolRegistry:
             return {"ok": False, "error": str(exc)}
         except Exception as exc:
             return {"ok": False, "error": f"{name} failed: {exc}"}
+
+    def _validate_arguments(self, tool: Tool, arguments: dict[str, Any]) -> None:
+        schema = tool.parameters or {}
+        properties = schema.get("properties") or {}
+        additional_allowed = schema.get("additionalProperties", True)
+        for key, value in arguments.items():
+            if key not in properties:
+                if not additional_allowed:
+                    raise ToolError(f"unexpected argument: {key}")
+                continue
+            _check_argument_type(key, value, properties[key])
+        for required in schema.get("required", []):
+            if required not in arguments:
+                raise ToolError(f"missing required argument: {required}")
 
     def resolve(self, value: str = ".", *, must_exist: bool = True) -> Path:
         candidate = (self.workspace / value).resolve(strict=False)
@@ -196,4 +231,3 @@ def truncate(value: str, limit: int) -> str:
         return value
     omitted = len(value) - limit
     return value[:limit] + f"\n...[truncated {omitted} characters]"
-
