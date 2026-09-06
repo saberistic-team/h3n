@@ -54,8 +54,8 @@ class KernelTests(unittest.TestCase):
             self.assertEqual(events[0], "Objective: inspect")
             self.assertEqual(events[2], "Inspecting files in .")
             self.assertEqual(events[3], "Completed: list")
-            self.assertRegex(events[1], r"Waiting for m \(step 1/20; 2 messages, [\d,]+ context chars\)\.\.\.")
-            self.assertRegex(events[4], r"Waiting for m \(step 2/20; 4 messages, [\d,]+ context chars\)\.\.\.")
+            self.assertRegex(events[1], r"Waiting for m \(step 1/∞; 2 messages, [\d,]+ context chars\)\.\.\.")
+            self.assertRegex(events[4], r"Waiting for m \(step 2/∞; 4 messages, [\d,]+ context chars\)\.\.\.")
 
     def test_micro_step_caps_tools_and_generation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -391,6 +391,139 @@ class EnvironmentContextTests(unittest.TestCase):
             quoted = '"' + str(spaced) + '"'
             self.assertIn(quoted, text)
             self.assertNotIn(str(spaced) + "\n", text)
+
+
+class UnlimitedAndCompletionTests(unittest.TestCase):
+    def test_default_is_unlimited(self):
+        self.assertEqual(parser({}).parse_args([]).max_steps, 0)
+
+    def test_zero_is_unlimited(self):
+        responses = [
+             {"role": "assistant", "tool_calls": [
+                   {"function": {"name": "list", "arguments": {"path": "."}}}] }
+             for _ in range(25)
+         ] + [{"role": "assistant", "content": "done"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            kernel = AgentKernel(FakeClient(responses), default_registry(Path(tmp)),
+                                 model="m", max_steps=0)
+            self.assertEqual(kernel.run("go"), "done")
+            self.assertEqual(sum(1 for m in kernel.messages if m.get("role") == "tool"), 25)
+
+    def test_positive_limit_is_enforced(self):
+        responses = [
+             {"role": "assistant", "tool_calls": [
+                   {"function": {"name": "list", "arguments": {"path": "."}}}] }
+             for _ in range(6)
+         ] + [{"role": "assistant", "content": "done"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            kernel = AgentKernel(FakeClient(responses), default_registry(Path(tmp)),
+                                 model="m", max_steps=5)
+            with self.assertRaises(StepLimitError):
+                kernel.run("go")
+
+    def test_negative_limit_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            parser({}).parse_args(["--max-steps", "-1"])
+
+    def test_progress_shows_infinity(self):
+        events: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            kernel = AgentKernel(FakeClient([
+                     {"role": "assistant", "tool_calls": [
+                          {"function": {"name": "list", "arguments": {}}}
+                      ]},
+                     {"role": "assistant", "content": "done"},
+                 ]), default_registry(Path(tmp)), model="m", on_event=events.append)
+            kernel.run("inspect")
+        self.assertTrue(any("step 1/∞" in event for event in events))
+
+    def test_ctrl_c_stops_unlimited_run(self):
+        class InterruptingClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def chat(self, **kwargs):
+                self.calls += 1
+                if self.calls == 3:
+                    raise KeyboardInterrupt
+                return {"role": "assistant", "tool_calls": [
+                         {"function": {"name": "list", "arguments": {}}}]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            kernel = AgentKernel(InterruptingClient(), default_registry(Path(tmp)),
+                                 model="m", max_steps=0)
+            with self.assertRaises(KeyboardInterrupt):
+                kernel.run("go")
+
+    def test_unlimited_deferred_calls_drain(self):
+        calls = [{"function": {"name": "list", "arguments": {}}} for _ in range(30)]
+        with tempfile.TemporaryDirectory() as tmp:
+            kernel = AgentKernel(FakeClient([
+                     {"role": "assistant", "tool_calls": calls},
+                     {"role": "assistant", "content": "done"},
+                 ]), default_registry(Path(tmp)), model="m", max_tools_per_step=2,
+                                  max_steps=0)
+            self.assertEqual(kernel.run("go"), "done")
+            self.assertEqual(sum(1 for m in kernel.messages if m.get("role") == "tool"), 30)
+
+    def test_verification_after_edit_succeeds(self):
+        write_call = {"function": {"name": "write",
+                                    "arguments": {"path": "a.txt", "content": "hello"}}}
+        verify_call = {"function": {"name": "shell", "arguments": {"command": "true"}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            kernel = AgentKernel(FakeClient([
+                     {"role": "assistant", "tool_calls": [write_call, verify_call]},
+                     {"role": "assistant", "content": "complete"},
+                 ]), default_registry(workspace, yes=True), model="m", max_steps=0)
+            kernel.run("make and verify")
+            notes = [m for m in kernel.messages
+                     if m.get("role") == "user" and "Verification succeeded" in m.get("content", "")]
+            self.assertEqual(len(notes), 1)
+            self.assertIn("no unverified changes remain", notes[0]["content"])
+            self.assertFalse(kernel.completion.changes_unverified)
+            self.assertTrue(kernel.completion.verified)
+
+    def test_failed_verification_leaves_changes_unverified(self):
+        write_call = {"function": {"name": "write",
+                                    "arguments": {"path": "a.txt", "content": "hello"}}}
+        failed_call = {"function": {"name": "shell", "arguments": {"command": "false"}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            kernel = AgentKernel(FakeClient([
+                     {"role": "assistant", "tool_calls": [write_call, failed_call]},
+                     {"role": "assistant", "content": "still fixing"},
+                 ]), default_registry(workspace, yes=True), model="m", max_steps=0)
+            kernel.run("make and verify")
+            self.assertTrue(kernel.completion.changes_unverified)
+            self.assertFalse(kernel.completion.verified)
+            self.assertFalse(any("Verification succeeded" in m.get("content", "")
+                                 for m in kernel.messages if m.get("role") == "user"))
+
+    def test_repeated_no_progress_reports_observation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "a.txt").write_text("same\n", encoding="utf-8")
+            read_call = {"role": "assistant", "tool_calls": [
+                     {"function": {"name": "read", "arguments": {"path": "a.txt"}}}]}
+            kernel = AgentKernel(FakeClient([read_call, read_call, read_call,
+                     {"role": "assistant", "content": "done"}]),
+                 default_registry(workspace), model="m", max_steps=0)
+            kernel.run("stuck")
+            self.assertTrue(any("no progress" in m.get("content", "")
+                                 for m in kernel.messages if m.get("role") == "user"))
+
+    def test_no_false_success_from_model_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kernel = AgentKernel(FakeClient([
+                     {"role": "assistant",
+                      "content": "All requirements are verified and complete!"}]),
+                 default_registry(Path(tmp)), model="m", max_steps=0)
+            self.assertEqual(kernel.run("done"),
+                              "All requirements are verified and complete!")
+            self.assertFalse(kernel.completion.verified)
+            self.assertFalse(any("Verification succeeded" in m.get("content", "")
+                                 for m in kernel.messages if m.get("role") == "user"))
 
 
 if __name__ == "__main__": unittest.main()

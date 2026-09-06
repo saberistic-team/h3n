@@ -62,7 +62,7 @@ h3n --show-reasoning --timeout 600 \
 --show-reasoning        Show model thinking on stderr (default)
 --hide-reasoning        Hide model thinking
 -y, --yes               Skip privileged-action prompts
---max-steps N           Bound agent iterations (default 20)
+--max-steps N           Bound agent iterations; 0 is unlimited (default)
 --max-tools-per-step N  Bound each tool batch (default 3)
 --action-tokens N       Optional generation cap; 0 is unlimited (default)
 --observation-limit N   Characters retained per tool result (default 8000)
@@ -80,6 +80,44 @@ intact.
 `H3N_MODEL`, `H3N_KERNEL`, `H3N_TIMEOUT`, and `OLLAMA_HOST` provide defaults; command-line options
 override them. The agent reports Ollama connectivity, model, HTTP, tool, timeout,
 permission, containment, and step-limit failures concisely.
+
+## Unlimited steps and verification-aware completion
+
+The default `--max-steps` is `0`, which means an **unlimited** run: the kernel keeps
+working until the model returns a final answer with no tool calls and no deferred calls
+remain. Progress is shown as `step N/∞`. Pass a positive integer (for example
+`--max-steps 5`) to impose an optional finite limit; the run then stops with a clear
+step-limit message once the limit is reached. Negative values are rejected at the CLI
+with `--max-steps must be 0 (unlimited) or positive`. There is no hidden default cap:
+the only stopping conditions are a successful final answer, a positive `--max-steps`
+limit, or user interruption.
+
+Unlimited runs are bounded in practice by a lightweight **completion controller** that
+only advises the model and never terminates a run or imposes a step limit:
+
+- It tracks whether workspace-changing tools (`write`, `edit`) have run since the last
+  successful verification.
+- It recognizes a successful verification by a `shell` command's exit status `0`, not by
+  anything the model claims, so a model cannot assert completion in plain text.
+- After a successful verification it appends a concise kernel observation stating that
+  verification succeeded, whether unverified changes remain, and that the model should
+  return its final answer immediately if every requirement is complete. It never claims
+  success from a zero exit status alone, and it never forces completion while writes or
+  edits remain unverified.
+- It detects three consecutive identical tool calls with identical arguments and results
+  and then appends an actionable observation asking the model to choose a different
+  action; this does not end the run or count toward a step limit.
+
+Kernel observations are appended as ordinary user messages so the tool call/response
+history stays valid.
+
+### Risks
+
+Because a default run is unbounded, an unclear task or a model that keeps issuing the
+same tool call can consume model time and tokens without finishing. The repetition
+observation and the per-step verification notes reduce but do not eliminate this. Use a
+positive `--max-steps` for bounded work, and interrupt an unresponsive run with
+`Ctrl-C`, which stops an unlimited run cleanly.
 
 ## Runtime environment context
 

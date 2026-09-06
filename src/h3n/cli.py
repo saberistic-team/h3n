@@ -218,7 +218,8 @@ def parser(environ: dict[str, str] | None = None) -> argparse.ArgumentParser:
                            help="hide model thinking")
     result.set_defaults(show_reasoning=True)
     result.add_argument("-y", "--yes", action="store_true", help="approve privileged tools without prompting")
-    result.add_argument("--max-steps", type=positive_int, default=20)
+    result.add_argument("--max-steps", type=nonnegative_steps, default=0,
+                        help="maximum agent steps; 0 means unlimited (default)")
     result.add_argument("--max-tools-per-step", type=positive_int, default=3,
                         help="maximum tool calls executed per model round (default: 3)")
     result.add_argument("--action-tokens", type=nonnegative_int, default=0,
@@ -248,6 +249,13 @@ def nonnegative_int(value: str) -> int:
     parsed = int(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be at least 0")
+    return parsed
+
+
+def nonnegative_steps(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("--max-steps must be 0 (unlimited) or positive")
     return parsed
 
 

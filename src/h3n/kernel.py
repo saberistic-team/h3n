@@ -128,18 +128,94 @@ class OllamaClient:
             raise OllamaError("Ollama returned no chat message")
 
 
+# Tools that modify the workspace and therefore leave it unverified until a
+# successful verification command runs afterwards.
+CHANGE_TOOLS = frozenset({"write", "edit"})
+
+
+class CompletionController:
+    """Verification-aware completion and no-progress detection.
+
+    The controller only produces observations for the model. It never
+    terminates a run and never imposes a step limit. It tracks whether
+    workspace-changing tools have run since the most recent successful
+    verification, recognizing a successful verification by a shell command's
+    exit status rather than by anything the model claims.
+    """
+
+    def __init__(self, repeat_limit: int = 3) -> None:
+        self.repeat_limit = repeat_limit
+        self.changes_unverified = False
+        self.verified = False
+        self._signature: str | None = None
+        self._repetition = 0
+        self._verified_this_batch = False
+
+    def begin_batch(self) -> None:
+        """Reset per-batch bookkeeping before executing a batch of calls."""
+        self._verified_this_batch = False
+
+    def record(self, name: str, arguments: Any, result: dict) -> str | None:
+        """Update state for one tool result; return a repetition observation or None."""
+        if result.get("ok") and name in CHANGE_TOOLS:
+            self.changes_unverified = True
+        if result.get("ok") and name == "shell":
+            payload = result.get("result")
+            if isinstance(payload, dict) and payload.get("exit_status") == 0:
+                self.verified = True
+                self.changes_unverified = False
+                self._verified_this_batch = True
+        return self._record_repetition(name, arguments, result)
+
+    def verification_observation(self) -> str | None:
+        """Return a concise completion note after a successful verification."""
+        if not self._verified_this_batch:
+            return None
+        state = ("no unverified changes remain"
+                 if not self.changes_unverified else "changes remain unverified")
+        return ("[kernel] Verification succeeded; " + state +
+                ". If every requirement is complete, return your final answer now; "
+                "otherwise make the remaining changes and verify them again.")
+
+    def _record_repetition(self, name: str, arguments: Any, result: dict) -> str | None:
+        signature = self._signature_for(name, arguments, result)
+        if signature == self._signature:
+            self._repetition += 1
+        else:
+            self._signature = signature
+            self._repetition = 1
+        if self._repetition >= self.repeat_limit and self._repetition % self.repeat_limit == 0:
+            return ("[kernel] The same tool call returned the same result "
+                    f"{self.repeat_limit} times in a row with no progress. "
+                    "Choose a different action, change the input, or return your final answer.")
+        return None
+
+    def _signature_for(self, name: str, arguments: Any, result: dict) -> str:
+        try:
+            parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+            args_key = json.dumps(parsed, sort_keys=True, default=str)
+        except (ValueError, TypeError):
+            args_key = str(arguments)
+        try:
+            result_key = json.dumps(result, sort_keys=True, default=str)
+        except (ValueError, TypeError):
+            result_key = str(result)
+        return f"{name}|{args_key}|{result_key}"
+
+
 class AgentKernel:
     def __init__(self, client: OllamaClient, registry: ToolRegistry, *, model: str,
-                 system: str = DEFAULT_SYSTEM, max_steps: int = 20,
+                 system: str = DEFAULT_SYSTEM, max_steps: int = 0,
                  stream: bool = True, show_reasoning: bool = False,
                  max_tools_per_step: int = 3, action_tokens: int = 0,
                  observation_limit: int = 8_000, context_limit: int = 50_000,
                  on_event: Callable[[str], None] | None = None,
                  on_reasoning: Callable[[str], None] | None = None):
-        if max_steps < 1:
-            raise ValueError("max_steps must be positive")
+        if max_steps < 0:
+            raise ValueError("max_steps must be zero (unlimited) or positive")
         self.client, self.registry, self.model = client, registry, model
         self.max_steps = max_steps
+        self.completion = CompletionController()
         self.stream = stream
         self.show_reasoning = show_reasoning
         self.max_tools_per_step = max_tools_per_step
@@ -206,10 +282,14 @@ class AgentKernel:
     def run(self, task: str) -> str:
         self.messages.append({"role": "user", "content": task})
         self.emit(f"Objective: {task}")
-        token_budget: int | None = self.action_tokens or None
+        self.completion = CompletionController()
         pending_calls: list[dict[str, Any]] = []
+        token_budget = self.action_tokens or None
+        step = 1
 
         def execute_calls(calls: list[dict[str, Any]]) -> None:
+            self.completion.begin_batch()
+            notes: list[str] = []
             for call in calls:
                 function = call.get("function") or {}
                 name = function.get("name", "")
@@ -227,38 +307,55 @@ class AgentKernel:
                 else:
                     self.emit(f"Completed: {name}")
                 observation = {
-                    "role": "tool",
-                    "content": self.observation(result),
-                    "tool_name": name,
-                }
+                     "role": "tool",
+                     "content": self.observation(result),
+                     "tool_name": name,
+                 }
                 if call.get("id"):
                     observation["tool_call_id"] = call["id"]
                 self.messages.append(observation)
+                note = self.completion.record(name, arguments, result)
+                if note:
+                    notes.append(note)
+            note = self.completion.verification_observation()
+            if note:
+                notes.append(note)
+            if notes:
+                  # A kernel observation is appended as a user message so that
+                  # tool observations keep a valid call/response protocol.
+                self.messages.append({"role": "user", "content": "\n".join(notes)})
 
-        for step in range(1, self.max_steps + 1):
+        while True:
+            if self.max_steps and step > self.max_steps:
+                raise StepLimitError(
+                    f"Reached the {self.max_steps}-step limit; request a higher limit "
+                     "or continue the conversation.")
+            step_label = f"step {step}/{self.max_steps or '\u221e'}"
             if pending_calls:
                 calls = pending_calls[:self.max_tools_per_step]
                 pending_calls = pending_calls[self.max_tools_per_step:]
                 self.emit(
                     f"Running {len(calls)} deferred tool call{'s' if len(calls) != 1 else ''} "
-                    f"(step {step}/{self.max_steps})"
-                )
-                # Record a matching assistant call message so native Ollama tool
-                # observations remain protocol-valid without another model request.
+                     f"({step_label})")
+                  # Record a matching assistant call message so native Ollama tool
+                  # observations remain protocol-valid without another model request.
                 self.messages.append({"role": "assistant", "content": "", "tool_calls": calls})
-                execute_calls(calls)
+                try:
+                    execute_calls(calls)
+                except KeyboardInterrupt:
+                    self.emit("Interrupted by user")
+                    raise
                 if pending_calls:
                     self.emit(
                         f"Deferred {len(pending_calls)} tool call"
-                        f"{'s' if len(pending_calls) != 1 else ''} to keep this step focused"
-                    )
+                         f"{'s' if len(pending_calls) != 1 else ''} to keep this step focused")
+                step += 1
                 continue
             self.compact_context()
             context_chars = sum(len(json.dumps(item, ensure_ascii=False)) for item in self.messages)
             self.emit(
-                f"Waiting for {self.model} (step {step}/{self.max_steps}; "
-                f"{len(self.messages)} messages, {context_chars:,} context chars)..."
-            )
+                f"Waiting for {self.model} ({step_label}; "
+                 f"{len(self.messages)} messages, {context_chars:,} context chars)...")
             saw_chunk = False
 
             def receive(part: dict[str, Any]) -> None:
@@ -270,11 +367,15 @@ class AgentKernel:
                 if thinking and self.show_reasoning and self.on_reasoning is not None:
                     self.on_reasoning(thinking)
 
-            message = self.client.chat(model=self.model, messages=self.messages,
-                                       tools=self.registry.schemas, stream=self.stream,
-                                       on_chunk=receive,
-                                       options=({"num_predict": token_budget}
-                                                if token_budget is not None else None))
+            try:
+                message = self.client.chat(model=self.model, messages=self.messages,
+                                          tools=self.registry.schemas, stream=self.stream,
+                                          on_chunk=receive,
+                                          options=({"num_predict": token_budget}
+                                                   if token_budget is not None else None))
+            except KeyboardInterrupt:
+                self.emit("Interrupted by user")
+                raise
             done_reason = message.pop("_done_reason", None)
             all_calls = message.get("tool_calls") or []
             calls = all_calls[:self.max_tools_per_step]
@@ -283,16 +384,14 @@ class AgentKernel:
             if not calls and done_reason in {"length", "max_tokens"}:
                 if token_budget is None:
                     raise StepLimitError(
-                        "model stopped because of its generation limit without producing "
-                        "an action or final response"
-                    )
+                          "model stopped because of its generation limit without producing "
+                           "an action or final response")
                 self.emit(
                     f"Generation budget reached ({token_budget} tokens); "
-                    "retrying once without an action-token cap"
-                )
+                      "retrying once without an action-token cap")
                 token_budget = None
-                # Do not put a partial reasoning turn into history. Retrying the
-                # same prompt with a larger budget avoids repetitive continuations.
+                  # Do not put a partial reasoning turn into history. Retrying the
+                  # same prompt with a larger budget avoids repetitive continuations.
                 continue
             if calls:
                 message = dict(message)
@@ -306,5 +405,9 @@ class AgentKernel:
                 self.emit(decision)
             if deferred:
                 self.emit(f"Deferred {deferred} tool call{'s' if deferred != 1 else ''} to keep this step focused")
-            execute_calls(calls)
-        raise StepLimitError(f"maximum step count reached ({self.max_steps})")
+            try:
+                execute_calls(calls)
+            except KeyboardInterrupt:
+                self.emit("Interrupted by user")
+                raise
+            step += 1
